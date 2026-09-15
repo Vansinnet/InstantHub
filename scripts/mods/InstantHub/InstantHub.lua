@@ -1,3 +1,13 @@
+---@class InstantHubMod: DMFMod
+---@field event_state_title_reset fun()
+---@field event_loading_finished fun()
+---@field event_player_set_profile fun(self: InstantHubMod, player: Player, profile: table?)
+---@class InstantHubSelectionBarrier
+---@field promise Promise<unknown>
+---@field character_id string
+---@class InstantHubPersistentState
+---@field selection_barrier InstantHubSelectionBarrier?
+---@type InstantHubMod
 local mod = get_mod("InstantHub")
 local MultiplayerSession = require("scripts/managers/multiplayer/multiplayer_session")
 local Application = rawget(_G, "Application")
@@ -7,6 +17,7 @@ local IS_PLAYSTATION = rawget(_G, "IS_PLAYSTATION")
 local IS_XBS = rawget(_G, "IS_XBS")
 local Xbox = rawget(_G, "Xbox")
 local persistent_state = mod:persistent_table("runtime_state")
+---@cast persistent_state InstantHubPersistentState
 
 local settings = {}
 local setting_keys = { "hub_caching", "show_notifications", "preload_hub", "reserve_hub_server", "preconnect_hub_server", "mourningstar_region", "preload_psychanium" }
@@ -126,6 +137,7 @@ local mission_end_preconnection = {
     party_id = nil,
     mission_session = nil,
     event_object = nil,
+    ---@type PartyImmateriumHubSessionBoot?
     session_boot = nil,
     speculative = false,
     mission_exit_loading = false,
@@ -1434,6 +1446,7 @@ start_selected_character_commit = function(character_id)
 
     local generation = hub_preconnection.generation
     local barrier = persistent_state.selection_barrier
+    ---@type Promise<unknown>
     local promise
     local committed_character_id
 
@@ -1609,6 +1622,14 @@ local function rollback_mission_end_preconnection()
     clear_mission_end_preconnection_ownership()
 end
 
+local function solo_hub_after_mission_enabled()
+    local solo_mourningstar = get_mod("SoloMourningstar")
+
+    return solo_mourningstar and solo_mourningstar:is_enabled()
+        and solo_mourningstar:get("solo_hub_on_enter")
+        and solo_mourningstar:get("solo_hub_after_mission")
+end
+
 local function begin_mission_end_preconnection(score)
     rollback_mission_end_preconnection()
 
@@ -1626,17 +1647,31 @@ local function begin_mission_end_preconnection(score)
         return
     end
 
+    mission_end_preload_active = true
+    start_hub_preload(true)
+
+    if solo_hub_after_mission_enabled() then
+        return
+    end
+
     mission_end_preconnection.score = score
     mission_end_preconnection.party_id = party_manager:party_id()
     mission_end_preconnection.mission_session = multiplayer_session_manager._session
-    mission_end_preload_active = true
-
-    start_hub_preload(true)
 end
 
 
 local function try_start_mission_end_preconnection(score)
-    if mission_end_preconnection.score ~= score or mission_end_preconnection.speculative then
+    if mission_end_preconnection.score ~= score then
+        return
+    end
+
+    if solo_hub_after_mission_enabled() then
+        rollback_mission_end_preconnection()
+
+        return
+    end
+
+    if mission_end_preconnection.speculative then
         return
     end
 
@@ -1662,13 +1697,14 @@ local function try_start_mission_end_preconnection(score)
 
     local event_object = multiplayer_session_manager:party_immaterium_hot_join_hub_server()
     local session_boot = multiplayer_session_manager._session_boot
-    local valid_boot = session_boot
+    local reserved_boot = session_boot
         and session_boot:event_object() == event_object
         and session_boot._matched_hub_session_id == matched_session_id
-        and multiplayer_session_manager._session == mission_session
+    local valid_boot = reserved_boot and multiplayer_session_manager._session == mission_session
 
     if not valid_boot then
-        if session_boot and session_boot:event_object() == event_object then
+        -- A different mod may have replaced the requested hub boot with its own session.
+        if reserved_boot then
             multiplayer_session_manager:clear_session_boot()
         end
 
@@ -1779,34 +1815,36 @@ local function prepare_hub_caches()
     start_psychanium_preload()
 end
 
+local function unregister_events()
+    local event_manager = registered_event_manager
+    registered_event_manager = nil
+
+    -- Deleted class instances still exist, but method lookup raises an error.
+    if event_manager and not rawget(event_manager, "__deleted") then
+        event_manager:unregister(mod, "event_loading_finished")
+        event_manager:unregister(mod, "event_player_set_profile")
+        event_manager:unregister(mod, "event_state_title_reset")
+    end
+end
+
 local function register_events()
     local event_manager = Managers.event
+
+    if event_manager and rawget(event_manager, "__deleted") then
+        event_manager = nil
+    end
 
     if registered_event_manager == event_manager then
         return
     end
 
-    if registered_event_manager then
-        registered_event_manager:unregister(mod, "event_loading_finished")
-        registered_event_manager:unregister(mod, "event_player_set_profile")
-        registered_event_manager:unregister(mod, "event_state_title_reset")
-        registered_event_manager = nil
-    end
+    unregister_events()
 
     if event_manager then
         event_manager:register(mod, "event_loading_finished", "event_loading_finished")
         event_manager:register(mod, "event_player_set_profile", "event_player_set_profile")
         event_manager:register(mod, "event_state_title_reset", "event_state_title_reset")
         registered_event_manager = event_manager
-    end
-end
-
-local function unregister_events()
-    if registered_event_manager then
-        registered_event_manager:unregister(mod, "event_loading_finished")
-        registered_event_manager:unregister(mod, "event_player_set_profile")
-        registered_event_manager:unregister(mod, "event_state_title_reset")
-        registered_event_manager = nil
     end
 end
 
