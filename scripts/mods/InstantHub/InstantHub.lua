@@ -7,6 +7,13 @@
 ---@field character_id string
 ---@class InstantHubPersistentState
 ---@field selection_barrier InstantHubSelectionBarrier?
+---@class InstantHubPackageHandoffRecord
+---@field id number
+---@field loaded boolean
+---@field package_manager table
+---@class InstantHubPackageHandoff
+---@field scopes table<string, table<string, InstantHubPackageHandoffRecord>>
+---@field hub_theme_tag string?
 ---@type InstantHubMod
 local mod = get_mod("InstantHub")
 local MultiplayerSession = require("scripts/managers/multiplayer/multiplayer_session")
@@ -18,6 +25,11 @@ local IS_XBS = rawget(_G, "IS_XBS")
 local Xbox = rawget(_G, "Xbox")
 local persistent_state = mod:persistent_table("runtime_state")
 ---@cast persistent_state InstantHubPersistentState
+local package_handoff = mod:persistent_table("package_handoff")
+---@cast package_handoff InstantHubPackageHandoff
+
+package_handoff.scopes = package_handoff.scopes or {}
+local reload_hub_theme_tag = package_handoff.hub_theme_tag
 
 local settings = {}
 local setting_keys = { "hub_caching", "show_notifications", "preload_hub", "reserve_hub_server", "preconnect_hub_server", "mourningstar_region", "preload_psychanium" }
@@ -87,6 +99,42 @@ local hub_theme_preload = new_preload("InstantHub:MourningstarTheme", "InstantHu
 local psychanium_preload = new_preload("InstantHub:Psychanium", "InstantHub: Psychanium / Meat Grinder preloaded")
 local local_profile_preload = new_preload("InstantHub:LocalProfile", "InstantHub: Local profile resources preloaded")
 local preloads = { local_profile_preload, hub_theme_preload, hub_preload, psychanium_preload }
+
+local function handoff_records(preload, create)
+    local records = package_handoff.scopes[preload.reference_name]
+
+    if not records and create then
+        records = {}
+        package_handoff.scopes[preload.reference_name] = records
+    end
+
+    return records
+end
+
+local function remember_package(preload, entry, package_manager)
+    local records = handoff_records(preload, true)
+
+    records[entry.name] = {
+        id = entry.id,
+        loaded = entry.loaded,
+        package_manager = package_manager,
+    }
+end
+
+local function forget_package(preload, name, id)
+    local records = handoff_records(preload)
+    local record = records and records[name]
+
+    if not record or id and record.id ~= id then
+        return
+    end
+
+    records[name] = nil
+
+    if not next(records) then
+        package_handoff.scopes[preload.reference_name] = nil
+    end
+end
 
 local preload_triggered_once = false
 local hub_ready = false
@@ -240,13 +288,17 @@ local function release_preload_package(preload, name)
     dequeue_package(preload, entry)
 
     if entry.id then
+        local id = entry.id
+
         if preload.pending_ids[entry.id] then
             preload.pending_ids[entry.id] = nil
             preload.pending_count = preload.pending_count - 1
         end
 
-        if Managers.package then
-            Managers.package:release(entry.id)
+        forget_package(preload, name, id)
+
+        if entry.package_manager and entry.package_manager == Managers.package then
+            entry.package_manager:release(id)
         end
     end
 end
@@ -286,9 +338,15 @@ local function release_preload(preload)
     if package_manager then
         for _, entry in pairs(packages) do
             if entry.id then
-                package_manager:release(entry.id)
+                forget_package(preload, entry.name, entry.id)
+
+                if entry.package_manager == package_manager then
+                    package_manager:release(entry.id)
+                end
             end
         end
+    else
+        package_handoff.scopes[preload.reference_name] = nil
     end
 end
 
@@ -445,6 +503,13 @@ local function submit_package(preload, entry, prioritize)
         preload.pending_ids[id] = nil
         preload.pending_count = preload.pending_count - 1
 
+        local records = handoff_records(preload)
+        local record = records and records[name]
+
+        if record and record.id == id then
+            record.loaded = true
+        end
+
         local callbacks = entry.callbacks
 
         entry.callbacks = {}
@@ -464,11 +529,74 @@ local function submit_package(preload, entry, prioritize)
     local id = package_manager:load(name, preload.reference_name, package_loaded, entry.prioritize)
 
     entry.id = id
+    entry.package_manager = package_manager
     preload.pending_ids[id] = true
     preload.pending_count = preload.pending_count + 1
+    remember_package(preload, entry, package_manager)
 
     return true
 end
+
+local function adopt_handoff_packages()
+    local package_manager = Managers.package
+
+    if not package_manager then
+        return
+    end
+
+    for _, preload in ipairs(preloads) do
+        local records = handoff_records(preload)
+
+        if records then
+            local names = {}
+
+            for name in pairs(records) do
+                names[#names + 1] = name
+            end
+
+            for _, name in ipairs(names) do
+                local record = records[name]
+
+                if record.package_manager ~= package_manager then
+                    records[name] = nil
+                else
+                    local entry = {
+                        name = name,
+                        loaded = package_manager:has_loaded_id(record.id),
+                        queued = false,
+                        prioritize = false,
+                        warn_unavailable = false,
+                        callbacks = {},
+                        id = record.id,
+                        package_manager = package_manager,
+                    }
+
+                    preload.packages[name] = entry
+
+                    if entry.loaded then
+                        record.loaded = true
+                    else
+                        local old_id = record.id
+
+                        entry.id = nil
+                        entry.queued = true
+                        preload.queue_first = entry
+                        preload.queue_last = entry
+                        preload.queued_count = 1
+                        submit_package(preload, entry, false)
+                        package_manager:release(old_id)
+                    end
+                end
+            end
+
+            if not next(records) then
+                package_handoff.scopes[preload.reference_name] = nil
+            end
+        end
+    end
+end
+
+adopt_handoff_packages()
 
 local function preload_priority(preload)
     if preload_destination and preload_destination ~= hub_mission_name and preload_destination ~= psychanium_mission_name then
@@ -1850,6 +1978,8 @@ end
 
 mod.event_state_title_reset = function()
     set_preload_destination(nil)
+    reload_hub_theme_tag = nil
+    package_handoff.hub_theme_tag = nil
 
     for _, preload in ipairs(preloads) do
         release_preload(preload)
@@ -2402,6 +2532,17 @@ mod.on_enabled = function()
         reset_preload(local_profile_preload)
     end
 
+    if reload_hub_theme_tag then
+        if setting("preload_hub") or setting("hub_caching") then
+            start_hub_theme_preload(reload_hub_theme_tag)
+        else
+            release_preload(hub_theme_preload)
+        end
+
+        reload_hub_theme_tag = nil
+        package_handoff.hub_theme_tag = nil
+    end
+
     local state_name = Managers.presence and Managers.presence._current_game_state_name
 
     if state_name == "StateGameplay" then
@@ -2425,6 +2566,8 @@ end
 
 mod.on_disabled = function()
     set_preload_destination(nil)
+    reload_hub_theme_tag = nil
+    package_handoff.hub_theme_tag = nil
     unregister_events()
     mission_end_preload_active = false
     rollback_mission_end_preconnection()
@@ -2519,7 +2662,7 @@ mod.on_game_state_changed = function(status, state_name)
     end
 end
 
-mod.on_unload = function()
+mod.on_unload = function(exit_game)
     set_preload_destination(nil)
     unregister_events()
     mission_end_preload_active = false
@@ -2527,8 +2670,19 @@ mod.on_unload = function()
     rollback_hub_preconnection("instant_hub_unloaded")
     clear_character_selection_tracking(true)
     reset_title_acceleration(true, true)
-    release_preload(hub_preload)
-    release_preload(hub_theme_preload)
-    release_preload(psychanium_preload)
-    release_preload(local_profile_preload)
+
+    if exit_game then
+        reload_hub_theme_tag = nil
+        package_handoff.hub_theme_tag = nil
+        release_preload(hub_preload)
+        release_preload(hub_theme_preload)
+        release_preload(psychanium_preload)
+        release_preload(local_profile_preload)
+    else
+        package_handoff.hub_theme_tag = hub_theme_preload.active_theme_tag or reload_hub_theme_tag
+
+        for _, preload in ipairs(preloads) do
+            preload.generation = preload.generation + 1
+        end
+    end
 end
