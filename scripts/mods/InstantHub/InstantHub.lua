@@ -1876,7 +1876,9 @@ local function start_local_profile_preload(profile, warn_unavailable)
     local packages_to_release = {}
 
     local function collect_profile_packages()
-        local profile_packages = resolver:resolve_profile_packages(profile)
+        -- Darktide 1.13.0 renamed resolve_profile_packages to _resolve_profile_packages.
+        local resolve = resolver._resolve_profile_packages or resolver.resolve_profile_packages
+        local profile_packages = resolve(resolver, profile)
 
         for _, package_data in pairs(profile_packages) do
             for package_name in pairs(package_data.dependencies) do
@@ -2177,6 +2179,13 @@ end)
 mod:hook("MultiplayerSessionManager", "poll_available_session", function(func, self, ...)
     if hub_preconnection.play_committed and preconnection_owns_session(self) then
         return Managers.mechanism:wanted_transition()
+    end
+
+    -- Darktide 1.13.0: StateMainMenu now calls poll_available_session (not
+    -- find_available_session) while a session boot is in flight, so mirror the
+    -- find_available_session hook's early hand-off to StateLoading here.
+    if hub_preconnection.play_committed and not self._session and preconnection_owns_boot(self) then
+        return require("scripts/game_states/game/state_loading"), {}
     end
 
     return func(self, ...)
